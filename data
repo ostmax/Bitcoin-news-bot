@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import logging
+from pathlib import Path
+import polars as pl
+
+BASE_DIR = Path("/home/ostmax/projects/active/quant_found")
+
+IMOEXF_DIR = BASE_DIR / "data/imoexf/microbars"
+STOCKS_DIR = BASE_DIR / "data/stocks_15m"
+
+OUT = BASE_DIR / "research/research_dataset.parquet"
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("dataset_builder")
+
+
+# =========================================================
+# LOAD IMOEXF
+# =========================================================
+
+def load_imoexf():
+    files = list(IMOEXF_DIR.glob("*.parquet"))
+
+    if not files:
+        raise RuntimeError("IMOEXF data not found")
+
+    df = pl.concat([pl.read_parquet(f) for f in files])
+
+    df = df.select([
+        "timestamp",
+        pl.lit("IMOEXF").alias("symbol"),
+        "close"
+    ])
+
+    return df
+
+
+# =========================================================
+# LOAD STOCKS
+# =========================================================
+
+def load_stocks():
+    files = list(STOCKS_DIR.glob("*.parquet"))
+
+    if not files:
+        raise RuntimeError("Stocks data not found")
+
+    dfs = []
+
+    for f in files:
+        symbol = f.stem
+
+        df = pl.read_parquet(f).select([
+            "timestamp",
+            "close"
+        ])
+
+        df = df.with_columns([
+            pl.lit(symbol).alias("symbol")
+        ])
+
+        dfs.append(df)
+
+    return pl.concat(dfs)
+
+
+# =========================================================
+# BUILD DATASET
+# =========================================================
+
+def build():
+
+    log.info("Loading IMOEXF...")
+    df_idx = load_imoexf()
+
+    log.info("Loading stocks...")
+    df_stocks = load_stocks()
+
+    log.info("Merging...")
+
+    df = pl.concat([df_idx, df_stocks])
+
+    df = df.sort(["symbol", "timestamp"])
+
+    # =====================================================
+    # RETURNS
+    # =====================================================
+
+    df = df.with_columns([
+        pl.col("close").pct_change().over("symbol").alias("ret")
+    ])
+
+    # =====================================================
+    # PIVOT → wide format
+    # =====================================================
+
+    log.info("Pivoting...")
+
+    pivot = df.pivot(
+        values="ret",
+        index="timestamp",
+        columns="symbol"
+    ).sort("timestamp")
+
+    # =====================================================
+    # SYNTHETIC INDEX
+    # =====================================================
+
+    log.info("Building synthetic index...")
+
+    stock_cols = [c for c in pivot.columns if c not in ["timestamp", "IMOEXF"]]
+
+    pivot = pivot.with_columns([
+        pl.mean_horizontal(stock_cols).alias("synthetic")
+    ])
+
+    # =====================================================
+    # SPREAD
+    # =====================================================
+
+    pivot = pivot.with_columns([
+        (pl.col("IMOEXF") - pl.col("synthetic")).alias("spread")
+    ])
+
+    # =====================================================
+    # Z-SCORE
+    # =====================================================
+
+    pivot = pivot.with_columns([
+        (
+            (pl.col("spread") - pl.col("spread").rolling_mean(100)) /
+            pl.col("spread").rolling_std(100)
+        ).alias("zscore")
+    ])
+
+    # =====================================================
+    # SIGNAL
+    # =====================================================
+
+    pivot = pivot.with_columns([
+        pl.when(pl.col("zscore") > 2).then(-1)
+        .when(pl.col("zscore") < -2).then(1)
+        .otherwise(0)
+        .alias("signal")
+    ])
+
+    # =====================================================
+    # FORWARD RETURN (для проверки)
+    # =====================================================
+
+    pivot = pivot.with_columns([
+        pl.col("IMOEXF").shift(-1).alias("ret_fwd")
+    ])
+
+    pivot = pivot.with_columns([
+        (pl.col("signal") * pl.col("ret_fwd")).alias("pnl")
+    ])
+
+    # =====================================================
+    # SAVE
+    # =====================================================
+
+    pivot.write_parquet(OUT)
+
+    log.info(f"Saved dataset → {OUT}")
+
+    log.info(f"Rows: {len(pivot)}")
+
+    log.info(f"Avg PnL: {pivot.select(pl.col('pnl').mean())}")
+
+    log.info("Done.")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+    build()
